@@ -132,10 +132,8 @@ class EditRequestModel(BaseModel):
 class EditResponseModel(BaseModel):
     message: str
     image_path: str
-    root_image_path: str  # New field for root directory image path
-    image_url: str
     preview_url: str
-    root_image_url: str  # New field for root directory image URL
+   
 
 # Initialize Gemini
 def setup_gemini():
@@ -162,6 +160,7 @@ def extract_search_prompt(prompt: str) -> str:
     
     response = model.generate_content(extraction_prompt)
     search_prompt = response.text.strip()
+    print(f"Extracted search prompt: {search_prompt}")
     return search_prompt
 
 def determine_operation_from_prompt(prompt: str) -> str:
@@ -241,17 +240,23 @@ async def call_stability_api(operation: str, image_data: bytes, params: Dict[str
     return response.content
 
 # Main API endpoint for image editing
-@app.post("/edit", response_model=EditResponseModel)
+# Modify the edit endpoint to return the image directly with the appropriate content type
+@app.post("/edit")
 async def edit_image(
     image: UploadFile = File(...),
     prompt: str = Form(None),
     operation: str = Form(None),
     search_prompt: str = Form(None),
+    left: int = Form(None),
+    right: int = Form(None),
+    up: int = Form(None),
+    down: int = Form(None),
+    output_format: str = Form("png"),
     request: Request = None
 ):
     """
     Edit an image based on the provided operation and prompt.
-    Returns a JSON response with the path to the saved image and clickable URLs.
+    Returns the edited image directly as bytes, similar to the Stability AI API.
     """
     # Process the uploaded image
     try:
@@ -287,7 +292,23 @@ async def edit_image(
         params["prompt"] = prompt
     
     if search_prompt:
-        params["search_prompt"] = search_prompt
+        params["select_prompt"] = search_prompt
+    
+    # Add outpaint-specific parameters if the operation is outpaint
+    if operation == "outpaint":
+        # Add direction parameters if provided
+        if left is not None:
+            params["left"] = str(left)
+        if right is not None:
+            params["right"] = str(right)
+        if up is not None:
+            params["up"] = str(up)
+        if down is not None:
+            params["down"] = str(down)
+    
+    # Add output format if specified
+    if output_format:
+        params["output_format"] = output_format
     
     # Call Stability AI API
     try:
@@ -296,163 +317,26 @@ async def edit_image(
         
         # Generate a unique filename based on timestamp and operation
         timestamp = int(time.time())
-        file_basename = f"edited_{timestamp}_{operation}.png"
+        file_extension = output_format.lower() if output_format else "png"
+        file_basename = f"edited_{timestamp}_{operation}.{file_extension}"
         
-        # Save the image in the output directory
+        # Save the image in the output directory (for logging/tracking purposes)
         output_file_path = os.path.join(OUTPUT_DIR, file_basename)
         with open(output_file_path, "wb") as f:
             f.write(result)
         
-        # Save the image in the root directory as well
-        root_file_path = file_basename
-        with open(root_file_path, "wb") as f:
-            f.write(result)
-        
-        # Build URLs for accessing the image
-        base_url = str(request.base_url).rstrip('/')
-        direct_image_url = f"{base_url}/output/{file_basename}"  # Direct image URL from output directory
-        preview_url = f"{base_url}/view-image/{file_basename}"   # Preview page URL
-        root_image_url = f"{base_url}/root-images/{file_basename}"  # Direct image URL from root directory
-        
         # Print success message
         print(f"✅ Image edited successfully using {operation} operation!")
         print(f"✅ Saved to output directory: {output_file_path}")
-        print(f"✅ Saved to root directory: {root_file_path}")
-        
-        # Return JSON response with image paths and URLs
-        return {
-            "message": f"Image successfully edited using {operation} operation",
-            "image_path": output_file_path,
-            "root_image_path": root_file_path,
-            "image_url": direct_image_url,
-            "preview_url": preview_url,
-            "root_image_url": root_image_url
-        }
+       
+        # Return the image directly
+        media_type = f"image/{file_extension}"
+        return Response(content=result, media_type=media_type)
     except Exception as e:
         print(f"❌ Error in API response: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error during image editing: {str(e)}")
+    
 
-# Endpoint to view an image in a nice HTML template
-@app.get("/view-image/{filename}")
-async def view_image(request: Request, filename: str):
-    """
-    Renders a nice HTML page to view the image.
-    """
-    # Check if image exists in output directory
-    output_path = os.path.join(OUTPUT_DIR, filename)
-    root_path = filename
-    
-    if os.path.exists(output_path):
-        # Get the base URL
-        base_url = str(request.base_url).rstrip('/')
-        image_url = f"{base_url}/output/{filename}"
-    elif os.path.exists(root_path):
-        # If image doesn't exist in output dir but exists in root dir
-        base_url = str(request.base_url).rstrip('/')
-        image_url = f"{base_url}/root-images/{filename}"
-    else:
-        raise HTTPException(status_code=404, detail="Image not found")
-    
-    # Extract operation from filename
-    operation = "unknown"
-    if "_" in filename:
-        try:
-            operation = filename.split("_")[2].split(".")[0]
-        except:
-            pass
-    
-    # Render the HTML template
-    return templates.TemplateResponse(
-        "image_view.html",
-        {
-            "request": request,
-            "image_url": image_url,
-            "title": f"Image edited with {operation.upper()} operation"
-        }
-    )
-
-# Endpoint to get a direct file response from root or output directory
-@app.get("/image-file/{filename}")
-async def get_image_file(filename: str):
-    """
-    Returns the actual image file directly from either root or output directory
-    """
-    # Check both locations
-    output_path = os.path.join(OUTPUT_DIR, filename)
-    root_path = filename
-    
-    if os.path.exists(output_path):
-        file_path = output_path
-    elif os.path.exists(root_path):
-        file_path = root_path
-    else:
-        raise HTTPException(status_code=404, detail="Image not found")
-    
-    return FileResponse(
-        file_path,
-        media_type="image/png",
-        filename=filename
-    )
-
-# Endpoint to list all edited images
-@app.get("/images/list")
-async def list_images(request: Request):
-    """
-    List all edited images available in both the output directory and root directory with clickable URLs.
-    """
-    try:
-        # Get images from output directory
-        output_image_files = [f for f in os.listdir(OUTPUT_DIR) if f.endswith(('.png', '.jpg', '.jpeg', '.webp'))]
-        
-        # Get images from root directory
-        root_image_files = [f for f in os.listdir(".") if f.startswith("edited_") and f.endswith(('.png', '.jpg', '.jpeg', '.webp'))]
-        
-        # Remove duplicates
-        all_image_files = list(set(output_image_files + root_image_files))
-        
-        image_list = []
-        base_url = str(request.base_url).rstrip('/')
-        
-        for file in all_image_files:
-            # Check if file exists in output directory
-            output_path = os.path.join(OUTPUT_DIR, file)
-            root_path = file
-            
-            # Determine which path to use for metadata
-            if os.path.exists(output_path):
-                file_path = output_path
-                creation_time = os.path.getctime(file_path)
-                direct_url = f"{base_url}/output/{file}"
-            elif os.path.exists(root_path):
-                file_path = root_path
-                creation_time = os.path.getctime(file_path)
-                direct_url = f"{base_url}/root-images/{file}"
-            else:
-                continue  # Skip if file doesn't exist in either location
-            
-            preview_url = f"{base_url}/view-image/{file}"
-            
-            # Add to list with details
-            image_list.append({
-                "filename": file,
-                "output_path": output_path if os.path.exists(output_path) else None,
-                "root_path": root_path if os.path.exists(root_path) else None,
-                "direct_url": direct_url,
-                "preview_url": preview_url,
-                "created": creation_time
-            })
-        
-        # Sort by creation time, most recent first
-        image_list.sort(key=lambda x: x["created"], reverse=True)
-        
-        return {"images": image_list}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing images: {str(e)}")
-
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
